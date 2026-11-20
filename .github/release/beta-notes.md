@@ -10,6 +10,8 @@
 
 Mac 下载后解压，将 `盘览.app` 拖入应用程序目录。Windows 解压后运行 `MoleDesk.exe`。每个压缩包都包含使用说明。使用前需要分别安装对应平台的 [Mole CLI](https://github.com/tw93/Mole)；盘览不会自动安装或打包 Mole。
 
+详细的架构选择、校验、安装和卸载步骤见[安装与卸载说明](https://github.com/m2keloop/mole-desk#安装)。也可以让有终端或文件操作权限的 AI 助手阅读这份说明，协助选择软件包、核对校验值并安装；[AI 安装提示词](https://github.com/m2keloop/mole-desk#使用-ai-协助安装)中包含安装期间不清理文件的要求。
+
 ### 测试版限制
 
 - macOS 应用使用 ad-hoc 签名，未经 Apple Developer ID 签名和公证，下载后可能受到 Gatekeeper 限制。Windows 程序未签名，可能触发 SmartScreen；请确认下载来源和文件完整性。

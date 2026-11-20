@@ -1,11 +1,25 @@
 import AppKit
 import CoreServices
 
+struct AppDataActivity {
+    let date: Date
+    let source: String
+
+    func daysAgo(now: Date = Date(), calendar: Calendar = .current) -> Int? {
+        guard date <= now else { return nil }
+        return calendar.dateComponents([.day], from: calendar.startOfDay(for: date),
+                                       to: calendar.startOfDay(for: now)).day
+    }
+}
+
 struct InstalledApp {
     let url: URL
     let name: String
     let lastUsed: Date?
     let running: Bool
+    var suspiciousRecord = false
+    var bundleID: String?
+    var dataActivity: AppDataActivity?
 
     func daysSinceUse(now: Date = Date(), calendar: Calendar = .current) -> Int? {
         guard let lastUsed, lastUsed <= now else { return nil }
@@ -14,6 +28,10 @@ struct InstalledApp {
     }
     func ageDescription(now: Date = Date()) -> String {
         if running { return "正在运行" }
+        if let days = dataActivity?.daysAgo(now: now), lastUsed == nil {
+            return days == 0 ? "数据今天" : "数据 \(days) 天前"
+        }
+        if suspiciousRecord { return "记录存疑" }
         guard lastUsed != nil else { return "未记录" }
         guard let days = daysSinceUse(now: now) else { return "时间异常" }
         if days == 0 { return "今天" }
@@ -27,7 +45,9 @@ struct AppInventory {
     let unreadableRoots: [String]
 
     static func read(roots: [URL], runningPaths: Set<String>,
-                     lastUsed: (URL) -> Date? = spotlightLastUsed) -> AppInventory {
+                     lastUsed: (URL) -> Date? = spotlightLastUsed,
+                     fileDates: (URL) -> (Date?, Date?) = appFileDates,
+                     dataHome: URL? = nil, isProtected: (String) -> Bool = { _ in false }) -> AppInventory {
         let fm = FileManager.default
         var seen = Set<String>(), apps: [InstalledApp] = [], failures: [String] = []
         for root in roots {
@@ -53,10 +73,30 @@ struct AppInventory {
                     ?? info["CFBundleDisplayName"] as? String
                     ?? info["CFBundleName"] as? String
                     ?? canonical.deletingPathExtension().lastPathComponent
-                apps.append(InstalledApp(url: canonical, name: name, lastUsed: lastUsed(canonical),
-                                         running: runningPaths.contains(canonical.path)))
+                let recorded = lastUsed(canonical)
+                let dates = fileDates(canonical)
+                let suspicious = recorded.map { suspiciousUsageDate($0, creation: dates.0, modification: dates.1) } ?? false
+                apps.append(InstalledApp(url: canonical, name: name, lastUsed: suspicious ? nil : recorded,
+                                         running: runningPaths.contains(canonical.path), suspiciousRecord: suspicious,
+                                         bundleID: bundle.bundleIdentifier))
             }
             if failed { failures.append(root.path) }
+        }
+        if let dataHome, failures.isEmpty {
+            let ids = apps.compactMap(\.bundleID).map { $0.lowercased() }
+            let names = apps.map { $0.url.deletingPathExtension().lastPathComponent.lowercased() }
+            var idCounts: [String: Int] = [:], nameCounts: [String: Int] = [:]
+            ids.forEach { idCounts[$0, default: 0] += 1 }
+            names.forEach { nameCounts[$0, default: 0] += 1 }
+            for index in apps.indices where apps[index].lastUsed == nil && !apps[index].running {
+                let app = apps[index]
+                guard !isProtected(app.url.path) else { continue }
+                guard let id = app.bundleID, idCounts[id.lowercased()] == 1 else { continue }
+                let name = app.url.deletingPathExtension().lastPathComponent
+                let uniqueName = nameCounts[name.lowercased()] == 1 ? name : nil
+                apps[index].dataActivity = appDataActivity(home: dataHome, bundleID: id,
+                                                           bundleName: uniqueName, isProtected: isProtected)
+            }
         }
         apps.sort {
             switch ($0.running, $1.running, $0.lastUsed, $1.lastUsed) {
@@ -65,7 +105,11 @@ struct AppInventory {
             case (_, _, let a?, let b?) where a != b: return a < b
             case (_, _, nil, .some): return false
             case (_, _, .some, nil): return true
-            default: return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            default:
+                if let a = $0.dataActivity?.date, let b = $1.dataActivity?.date, a != b { return a < b }
+                if $0.dataActivity != nil && $1.dataActivity == nil { return true }
+                if $0.dataActivity == nil && $1.dataActivity != nil { return false }
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
             }
         }
         return AppInventory(apps: apps, unreadableRoots: failures)
@@ -75,6 +119,47 @@ struct AppInventory {
 func spotlightLastUsed(_ url: URL) -> Date? {
     guard let item = MDItemCreateWithURL(nil, url as CFURL) else { return nil }
     return MDItemCopyAttribute(item, kMDItemLastUsedDate) as? Date
+}
+
+func appFileDates(_ url: URL) -> (Date?, Date?) {
+    guard let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey]) else { return (nil, nil) }
+    return (values.creationDate, values.contentModificationDate)
+}
+
+// Equal timestamps are ambiguous: they may reflect a copied or newly installed bundle.
+func suspiciousUsageDate(_ used: Date, creation: Date?, modification: Date?) -> Bool {
+    guard let creation, let modification else { return true }
+    return [creation, modification].contains { abs(used.timeIntervalSince($0)) < 1 }
+}
+
+// Inspect exact matching paths only; directory timestamps do not cover nested changes.
+func appDataActivity(home: URL, bundleID: String?, bundleName: String?,
+                     isProtected: (String) -> Bool, now: Date = Date()) -> AppDataActivity? {
+    func safeComponent(_ value: String) -> Bool {
+        !value.isEmpty && value != "." && value != ".." && !value.hasPrefix(".") &&
+            value.rangeOfCharacter(from: .controlCharacters) == nil &&
+            !value.contains("/") && !value.contains("\\")
+    }
+    let library = home.standardizedFileURL.resolvingSymlinksInPath().appendingPathComponent("Library", isDirectory: true)
+    var candidates: [(URL, String)] = []
+    if let id = bundleID, safeComponent(id),
+       id.range(of: "^[A-Za-z0-9][A-Za-z0-9.-]*$", options: .regularExpression) != nil {
+        candidates.append((library.appendingPathComponent("Preferences/\(id).plist"), "偏好设置"))
+        candidates.append((library.appendingPathComponent("Caches/\(id)"), "缓存目录"))
+        candidates.append((library.appendingPathComponent("Application Support/\(id)"), "应用支持目录"))
+    }
+    if let name = bundleName, name.count >= 3, safeComponent(name) {
+        candidates.append((library.appendingPathComponent("Application Support/\(name)"), "同名应用支持目录"))
+    }
+    var newest: AppDataActivity?
+    for (candidate, source) in candidates {
+        let url = candidate.standardizedFileURL
+        guard !isProtected(url.path), url.resolvingSymlinksInPath().path == url.path,
+              let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .contentModificationDateKey]),
+              values.isSymbolicLink != true, let date = values.contentModificationDate, date <= now else { continue }
+        if newest == nil || date > newest!.date { newest = AppDataActivity(date: date, source: source) }
+    }
+    return newest
 }
 
 final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
@@ -116,9 +201,9 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         let hero = HeroBackground()
         let heading = NSTextField(labelWithString: "应用使用情况")
         heading.font = .systemFont(ofSize: 21, weight: .semibold); heading.textColor = .white
-        let subtitle = NSTextField(labelWithString: "最近打开时间来自系统记录，可能缺失或滞后")
+        let subtitle = NSTextField(labelWithString: "系统记录和数据修改时间仅供参考，并非完整使用历史")
         subtitle.textColor = NSColor.white.withAlphaComponent(0.7)
-        filterMenu.addItems(withTitles: ["全部应用", "30 天及以上", "90 天及以上", "180 天及以上", "1 年及以上", "未记录", "正在运行"])
+        filterMenu.addItems(withTitles: ["全部应用", "30 天及以上", "90 天及以上", "180 天及以上", "1 年及以上", "未记录或存疑", "正在运行", "数据线索 ≥90 天", "数据线索 ≥180 天", "数据线索 ≥1 年"])
         filterMenu.target = self; filterMenu.action = #selector(applyFilter)
         search.placeholderString = "搜索应用名称或路径"; search.delegate = self
         refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
@@ -136,7 +221,7 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         scroll.documentView = table; table.dataSource = self; table.delegate = self
         table.rowHeight = 40; table.style = .inset
         table.target = self; table.doubleAction = #selector(revealSelection)
-        for (id, title, width) in [("name", "应用", 350), ("date", "最近记录", 150), ("age", "距离上次记录", 130)] {
+        for (id, title, width) in [("name", "应用", 250), ("date", "Spotlight 记录", 145), ("activity", "数据线索", 130), ("age", "距记录时间", 130)] {
             let col = NSTableColumn(identifier: .init(id)); col.title = title; col.width = CGFloat(width)
             col.minWidth = id == "name" ? 180 : 105
             table.addTableColumn(col)
@@ -177,12 +262,13 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
 
     @objc func reload() {
         generation += 1
-        let run = generation, locations = roots, reader = metadata
+        let run = generation, locations = roots, reader = metadata, dataHome = home, protected = isProtected
         let running = Set(NSWorkspace.shared.runningApplications.compactMap { $0.bundleURL?.standardizedFileURL.resolvingSymlinksInPath().path })
         isLoading = true; refresh.isEnabled = false; uninstall.isEnabled = false
         status.stringValue = "正在读取应用和系统记录…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = AppInventory.read(roots: locations, runningPaths: running, lastUsed: reader)
+            let result = AppInventory.read(roots: locations, runningPaths: running, lastUsed: reader,
+                                           dataHome: dataHome, isProtected: protected)
             DispatchQueue.main.async {
                 guard self.generation == run else { return }
                 self.isLoading = false; self.refresh.isEnabled = true; self.inventory = result
@@ -203,14 +289,18 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
                 return matches && !app.running && (days.map { $0 >= limits[selected]! } ?? false)
             case 5: return matches && app.lastUsed == nil
             case 6: return matches && app.running
+            case 7...9:
+                let limits = [7:90, 8:180, 9:365]
+                return matches && !app.running && (app.dataActivity?.daysAgo().map { $0 >= limits[selected]! } ?? false)
             default: return matches
             }
         }
         table.deselectAll(nil); table.reloadData(); reveal.isEnabled = false; uninstall.isEnabled = false
         let missing = inventory?.apps.filter { $0.lastUsed == nil }.count ?? 0
         let incomplete = inventory?.unreadableRoots.isEmpty == false ? " · 部分目录无法读取" : ""
-        status.stringValue = "显示 \(visible.count) 项 · \(missing) 项无记录" + incomplete
-        status.toolTip = "时间来自 macOS Spotlight，记录可能缺失或滞后。正在运行的应用不计入未使用天数。"
+        let clues = inventory?.apps.filter { $0.dataActivity != nil }.count ?? 0
+        status.stringValue = "显示 \(visible.count) 项 · \(missing) 项无可靠记录 · \(clues) 条数据线索" + incomplete
+        status.toolTip = "数据线索是匹配的应用目录或偏好文件的修改时间，后台活动、同步和更新也可能修改它；不能证明最近使用或长期未使用。"
     }
     func controlTextDidChange(_ note: Notification) { applyFilter() }
     func numberOfRows(in tableView: NSTableView) -> Int { visible.count }
@@ -326,8 +416,16 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         let field = tableView.makeView(withIdentifier: id, owner: nil) as? NSTextField ?? NSTextField(labelWithString: "")
         field.identifier = id; field.textColor = .secondaryLabelColor
         field.font = .systemFont(ofSize: 12)
-        field.stringValue = id.rawValue == "date" ? app.lastUsed.map { dateFormatter.string(from: $0) } ?? "未记录" : app.ageDescription()
-        field.toolTip = app.running ? "应用当前正在运行；最近记录可能未及时更新" : nil
+        if id.rawValue == "date" {
+            field.stringValue = app.suspiciousRecord ? "记录存疑" : app.lastUsed.map { dateFormatter.string(from: $0) } ?? "未记录"
+            field.toolTip = app.suspiciousRecord ? "Spotlight 时间与创建或修改时间相同，或缺少核验信息，无法确认是否为实际使用时间。" : "Spotlight 时间可能缺失或滞后。"
+        } else if id.rawValue == "activity" {
+            field.stringValue = app.dataActivity.map { dateFormatter.string(from: $0.date) } ?? "无数据"
+            field.toolTip = app.dataActivity.map { "依据：\($0.source)的修改时间，仅检查该路径本身。后台活动、同步或更新也可能修改，并非最后使用时间。" }
+        } else {
+            field.stringValue = app.ageDescription()
+            field.toolTip = app.dataActivity.map { "依据：\($0.source)的修改时间，不代表实际使用时间。" } ?? (app.running ? "应用当前正在运行。" : "时间仅供参考。")
+        }
         return field
     }
 }

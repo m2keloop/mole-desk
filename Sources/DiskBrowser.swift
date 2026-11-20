@@ -1,5 +1,18 @@
 import AppKit
-import Darwin
+
+private struct MoleAnalysis: Decodable {
+    struct Entry: Decodable {
+        let path: String
+        let size: Int64
+        let isDirectory: Bool
+        let scanStatus: String
+        enum CodingKeys: String, CodingKey { case path, size; case isDirectory = "is_dir", scanStatus = "scan_status" }
+    }
+    let path: String
+    let entries: [Entry]
+    let scanStatus: String
+    enum CodingKeys: String, CodingKey { case path, entries; case scanStatus = "scan_status" }
+}
 
 final class DiskBrowser: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
     struct Item { let path: String; let bytes: Int64; let isDirectory: Bool }
@@ -13,6 +26,7 @@ final class DiskBrowser: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
     private let choose = NSButton(title: "选择目录…", target: nil, action: nil)
     private let reveal = NSButton(title: "在 Finder 显示", target: nil, action: nil)
     var items: [Item] = []
+    var moleExecutables = ["/opt/homebrew/bin/mo", "/usr/local/bin/mo", NSHomeDirectory() + "/.local/bin/mo"]
     private var current = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
     var task: Process?
     private var generation = 0
@@ -39,7 +53,7 @@ final class DiskBrowser: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.documentView = table
         table.dataSource = self; table.delegate = self; table.rowHeight = 40
         table.target = self; table.doubleAction = #selector(openItem)
-        for (id, title, width) in [("name", "项目", 470), ("size", "占用", 130)] {
+        for (id, title, width) in [("name", "项目", 470), ("size", "大小", 130)] {
             let col = NSTableColumn(identifier: .init(id)); col.title = title; col.width = CGFloat(width)
             table.addTableColumn(col)
         }
@@ -113,11 +127,18 @@ final class DiskBrowser: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
         current = url.standardizedFileURL
         pathLabel.stringValue = current.path
         items = []; table.reloadData()
-        state.stringValue = "正在统计…"
+        state.stringValue = "Mole 正在统计…"
         let path = current.path
+        guard let executable = moleExecutables.first(where: FileManager.default.isExecutableFile(atPath:)) else {
+            state.stringValue = "找不到 Mole，请先安装 Mole。"
+            return
+        }
         let process = Process(), out = Pipe(), errors = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/du")
-        process.arguments = ["-kx", "-d", "1", path]
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["analyze", "--json", path]
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        process.environment = environment
         process.standardOutput = out; process.standardError = errors
         do { try process.run(); task = process } catch {
             state.stringValue = "无法启动统计：" + error.localizedDescription
@@ -126,39 +147,31 @@ final class DiskBrowser: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
         DispatchQueue.global(qos: .utility).async {
             let group = DispatchGroup()
             group.enter()
-            var errorData = Data()
-            DispatchQueue.global(qos: .utility).async { errorData = errors.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+            DispatchQueue.global(qos: .utility).async { _ = errors.fileHandleForReading.readDataToEndOfFile(); group.leave() }
             let output = out.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             group.wait()
-            var found = [Item]()
-            for line in String(decoding: output, as: UTF8.self).split(separator: "\n") {
-                guard let tab = line.firstIndex(of: "\t"), let kb = Int64(line[..<tab]) else { continue }
-                let item = String(line[line.index(after: tab)...])
-                if item != path { found.append(Item(path: item, bytes: kb * 1024, isDirectory: true)) }
-            }
-            var listingFailed = false
-            do {
-                let children = try FileManager.default.contentsOfDirectory(atPath: path)
-                for name in children {
-                    let child = URL(fileURLWithPath: path, isDirectory: true).appendingPathComponent(name).path
-                    var details = stat()
-                    guard lstat(child, &details) == 0 else { listingFailed = true; continue }
-                    if (details.st_mode & S_IFMT) != S_IFDIR {
-                        found.append(Item(path: child, bytes: Int64(details.st_blocks) * 512, isDirectory: false))
-                    }
-                }
-            } catch { listingFailed = true }
+            let result = try? JSONDecoder().decode(MoleAnalysis.self, from: output)
+            let matchesPath = result.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path == path } ?? false
+            var found = matchesPath ? (result?.entries ?? []).compactMap { entry -> Item? in
+                let item = URL(fileURLWithPath: entry.path).standardizedFileURL
+                guard item.deletingLastPathComponent().path == path, entry.size >= 0 else { return nil }
+                return Item(path: item.path, bytes: entry.size, isDirectory: entry.isDirectory)
+            } : []
             found.sort { $0.bytes > $1.bytes }
             let status = process.terminationStatus
-            let hadErrors = !errorData.isEmpty || listingFailed
+            let incomplete = result?.scanStatus != "complete" || (result?.entries.contains { $0.scanStatus != "complete" } ?? true) || found.count != result?.entries.count
             DispatchQueue.main.async {
                 guard run == self.generation else { return }
                 self.task = nil
                 self.items = found; self.table.reloadData()
-                self.state.stringValue = status == 0 && !hadErrors
-                    ? "共 \(found.count) 项 · 双击目录查看下一级"
-                    : "部分目录无法读取，结果可能不完整 · 共 \(found.count) 项"
+                if status != 0 || result == nil || !matchesPath {
+                    self.state.stringValue = "Mole 统计失败或返回格式不受支持，请检查 Mole 版本和目录权限。"
+                } else if incomplete {
+                    self.state.stringValue = "Mole 统计不完整 · 共 \(found.count) 项"
+                } else {
+                    self.state.stringValue = "Mole 统计 · 共 \(found.count) 项 · 双击目录查看下一级"
+                }
             }
         }
     }

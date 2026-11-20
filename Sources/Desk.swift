@@ -18,7 +18,11 @@ final class Desk: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableView
     let headline = label("—", 38, weight: .semibold), info = label("", 12), status = label("", 12)
     let scan = NSButton(), reveal = NSButton(), trash = NSButton(), disk = NSButton(), protection = NSButton(), apps = NSButton()
     lazy var diskBrowser = DiskBrowser()
-    lazy var appUsage = AppUsageWindow()
+    lazy var appUsage: AppUsageWindow = {
+        let result = AppUsageWindow()
+        result.isProtected = { [weak self] path in self?.isProtected(path) ?? true }
+        return result
+    }()
     let spin = NSProgressIndicator(), distribution = Distribution()
     lazy var backup = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("local.lan.MoleDesk/last-preview.txt")
@@ -276,7 +280,7 @@ final class Desk: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableView
         let busy = scanPID > 0 || loading
         reveal.isEnabled = !sel.isEmpty
         trash.isEnabled = !busy && loadedDate != nil && !sel.isEmpty && sel.allSatisfy { $0.canReviewForTrash && !isProtected($0.path) }
-        trash.toolTip = "可选择 Mole 扫描到的常见缓存和已废弃扩展，操作前会再次核验。"
+        trash.toolTip = "Mole 负责扫描；盘览直接将所选项目移入废纸篓，操作前会再次核验。"
         scan.isEnabled = !loading && scan.title != "正在停止…"
         status.stringValue = scanPID > 0 ? "Mole 正在扫描，可继续查看上次结果…" :
             loading ? "正在读取预览…" : lastError ??

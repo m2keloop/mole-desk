@@ -85,6 +85,13 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
     let status = NSTextField(labelWithString: "")
     private let refresh = NSButton(title: "刷新", target: nil, action: nil)
     private let reveal = NSButton(title: "在 Finder 中显示", target: nil, action: nil)
+    let uninstall = NSButton(title: "Mole 卸载…", target: nil, action: nil)
+    var isProtected: (String) -> Bool = { _ in false }
+    var moleExecutables = ["/opt/homebrew/bin/mo", "/usr/local/bin/mo", NSHomeDirectory() + "/.local/bin/mo"]
+    private var uninstallTask: Process?
+    var home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+    lazy var uninstallRoots = [URL(fileURLWithPath: "/Applications", isDirectory: true),
+                               home.appendingPathComponent("Applications", isDirectory: true)]
     var inventory: AppInventory?
     var visible: [InstalledApp] = []
     var roots: [URL] = [
@@ -119,6 +126,11 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         reveal.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
         reveal.imagePosition = .imageLeading; reveal.target = self; reveal.action = #selector(revealSelection)
         reveal.isEnabled = false
+        uninstall.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
+        uninstall.imagePosition = .imageLeading; uninstall.target = self; uninstall.action = #selector(uninstallSelection)
+        uninstall.toolTip = "使用 Mole 预览关联文件，再在终端中确认卸载。"
+        uninstall.isEnabled = false
+        let actions = NSStackView(views: [reveal, uninstall]); actions.spacing = 8
         status.textColor = .secondaryLabelColor
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
         scroll.documentView = table; table.dataSource = self; table.delegate = self
@@ -130,7 +142,7 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             table.addTableColumn(col)
         }
         table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
-        for view in [hero, filterMenu, search, refresh, scroll, status, reveal] as [NSView] {
+        for view in [hero, filterMenu, search, refresh, scroll, status, actions] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view)
         }
         for view in [heading, subtitle] as [NSView] { view.translatesAutoresizingMaskIntoConstraints = false; hero.addSubview(view) }
@@ -146,10 +158,10 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             search.widthAnchor.constraint(equalToConstant: 230), search.leadingAnchor.constraint(greaterThanOrEqualTo: filterMenu.trailingAnchor, constant: 10),
             scroll.topAnchor.constraint(equalTo: filterMenu.bottomAnchor, constant: 12),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 10), scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -10),
-            scroll.bottomAnchor.constraint(equalTo: reveal.topAnchor, constant: -12),
-            reveal.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20), reveal.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -13),
-            status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24), status.centerYAnchor.constraint(equalTo: reveal.centerYAnchor),
-            status.trailingAnchor.constraint(lessThanOrEqualTo: reveal.leadingAnchor, constant: -10)
+            scroll.bottomAnchor.constraint(equalTo: actions.topAnchor, constant: -12),
+            actions.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20), actions.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -13),
+            status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24), status.centerYAnchor.constraint(equalTo: actions.centerYAnchor),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: actions.leadingAnchor, constant: -10)
         ])
     }
 
@@ -157,13 +169,18 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         window.center(); window.makeKeyAndOrderFront(nil)
         if !isLoading { reload() }
     }
-    func windowWillClose(_ notification: Notification) { generation += 1; isLoading = false; refresh.isEnabled = true }
+    func windowWillClose(_ notification: Notification) {
+        generation += 1; isLoading = false; refresh.isEnabled = true
+        if let task = uninstallTask, task.isRunning { task.terminate() }
+        uninstallTask = nil
+    }
 
     @objc func reload() {
         generation += 1
         let run = generation, locations = roots, reader = metadata
         let running = Set(NSWorkspace.shared.runningApplications.compactMap { $0.bundleURL?.standardizedFileURL.resolvingSymlinksInPath().path })
-        isLoading = true; refresh.isEnabled = false; status.stringValue = "正在读取应用和系统记录…"
+        isLoading = true; refresh.isEnabled = false; uninstall.isEnabled = false
+        status.stringValue = "正在读取应用和系统记录…"
         DispatchQueue.global(qos: .userInitiated).async {
             let result = AppInventory.read(roots: locations, runningPaths: running, lastUsed: reader)
             DispatchQueue.main.async {
@@ -189,7 +206,7 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             default: return matches
             }
         }
-        table.deselectAll(nil); table.reloadData(); reveal.isEnabled = false
+        table.deselectAll(nil); table.reloadData(); reveal.isEnabled = false; uninstall.isEnabled = false
         let missing = inventory?.apps.filter { $0.lastUsed == nil }.count ?? 0
         let incomplete = inventory?.unreadableRoots.isEmpty == false ? " · 部分目录无法读取" : ""
         status.stringValue = "显示 \(visible.count) 项 · \(missing) 项无记录" + incomplete
@@ -197,11 +214,105 @@ final class AppUsageWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
     }
     func controlTextDidChange(_ note: Notification) { applyFilter() }
     func numberOfRows(in tableView: NSTableView) -> Int { visible.count }
-    func tableViewSelectionDidChange(_ notification: Notification) { reveal.isEnabled = visible.indices.contains(table.selectedRow) }
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let selected = visible.indices.contains(table.selectedRow)
+        reveal.isEnabled = selected
+        uninstall.isEnabled = selected && !isLoading && uninstallTask == nil
+    }
     @objc func revealSelection() {
         guard visible.indices.contains(table.selectedRow) else { return }
         NSWorkspace.shared.activateFileViewerSelecting([visible[table.selectedRow].url])
     }
+    private func runningPaths() -> Set<String> {
+        Set(NSWorkspace.shared.runningApplications.compactMap { $0.bundleURL?.standardizedFileURL.resolvingSymlinksInPath().path })
+    }
+
+    @objc func uninstallSelection() {
+        guard visible.indices.contains(table.selectedRow), !isLoading, uninstallTask == nil, let inventory else { return }
+        let app = visible[table.selectedRow]
+        guard let executable = moleExecutables.first(where: FileManager.default.isExecutableFile(atPath:)) else {
+            showMessage("找不到 Mole", "请先安装 Mole。")
+            return
+        }
+        let name = app.url.deletingPathExtension().lastPathComponent
+        guard !name.isEmpty, !name.hasPrefix("-"), name.rangeOfCharacter(from: .controlCharacters) == nil else {
+            showMessage("无法预览", "此应用名称无法安全传给 Mole。")
+            return
+        }
+        let plan: AppRemovalPlan
+        do {
+            plan = try AppRemovalPlan.prepare(app: app, home: home, allowedRoots: uninstallRoots,
+                                              inventory: inventory.apps, inventoryComplete: inventory.unreadableRoots.isEmpty,
+                                              running: runningPaths(), isProtected: isProtected)
+        } catch {
+            showMessage("无法卸载", error.localizedDescription); return
+        }
+        let task = Process(), out = Pipe(), errors = Pipe()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = ["uninstall", "--dry-run", name]
+        task.standardInput = FileHandle.nullDevice
+        task.standardOutput = out; task.standardError = errors
+        var environment = ProcessInfo.processInfo.environment
+        environment["MOLE_DRY_RUN"] = "1"; environment["NO_COLOR"] = "1"; environment["TERM"] = "dumb"
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        task.environment = environment
+        do { try task.run() } catch { showMessage("无法启动 Mole", error.localizedDescription); return }
+        uninstallTask = task; uninstall.isEnabled = false; status.stringValue = "Mole 正在预览卸载和关联文件…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let group = DispatchGroup(); group.enter()
+            DispatchQueue.global(qos: .utility).async { _ = errors.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit(); group.wait()
+            let output = MoleUninstall.cleanOutput(String(decoding: data, as: UTF8.self))
+            DispatchQueue.main.async {
+                guard self.uninstallTask === task else { return }
+                self.uninstallTask = nil; self.applyFilter()
+                guard task.terminationStatus == 0,
+                      MoleUninstall.verifiedPreview(output, app: plan.app, home: self.home) else {
+                    self.showMessage("Mole 未能确认应用", "Mole 没有返回与所选路径一致的单个应用，或预览未完成。没有执行卸载。\n\n" + String(output.suffix(2000)))
+                    return
+                }
+                do { try plan.verify(running: self.runningPaths(), isProtected: self.isProtected) }
+                catch { self.showMessage("应用已变化", error.localizedDescription); return }
+                self.showUninstallPreview(output, app: app, plan: plan, executable: executable, name: name)
+            }
+        }
+    }
+
+    private func showUninstallPreview(_ output: String, app: InstalledApp, plan: AppRemovalPlan,
+                                      executable: String, name: String) {
+        let alert = NSAlert()
+        alert.messageText = "Mole 卸载预览：" + app.name
+        alert.informativeText = "以下为 Mole 的预览。继续将在终端重新扫描，需你再次核对应用路径和每个文件后确认。Mole 不读取盘览的自定义保护范围；不要确认包含受保护文件的清单。个人数据默认保留。"
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 560, height: 260))
+        scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        let text = NSTextView(frame: scroll.bounds); text.isEditable = false; text.isSelectable = true
+        text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        text.string = output; text.isVerticallyResizable = true; text.textContainer?.widthTracksTextView = true
+        scroll.documentView = text; alert.accessoryView = scroll
+        alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "在终端继续…")
+        alert.beginSheetModal(for: window) { result in
+            guard result == .alertSecondButtonReturn else { return }
+            do {
+                try plan.verify(running: self.runningPaths(), isProtected: self.isProtected)
+                let script = try MoleUninstall.commandScript(executable: executable, appName: name)
+                let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+                NSWorkspace.shared.open([script], withApplicationAt: terminal,
+                                        configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                    if let error {
+                        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+                        DispatchQueue.main.async { self.showMessage("无法打开终端", error.localizedDescription) }
+                    }
+                }
+            } catch { self.showMessage("无法继续", error.localizedDescription) }
+        }
+    }
+
+    private func showMessage(_ title: String, _ text: String) {
+        let alert = NSAlert(); alert.messageText = title; alert.informativeText = text
+        alert.addButton(withTitle: "好"); alert.beginSheetModal(for: window)
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard let id = tableColumn?.identifier, visible.indices.contains(row) else { return nil }
         let app = visible[row]

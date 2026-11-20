@@ -4,6 +4,8 @@
 
 Windows 原生界面移植及构建方法见 [Windows 说明](windows/README.md)。
 
+预发布安装包发布在 [GitHub Releases](https://github.com/m2keloop/mole-desk/releases)。推送形如 `v0.1.0-beta.1` 的标签会自动测试、构建并发布预发布版；工作流只在全部构建和测试通过后发布，不需要人工审核。测试版的系统要求、签名状态和已知限制以 Release 说明为准。
+
 ## 功能
 
 - **清理预览**：读取 Mole 的扫描清单，按分类、大小和路径筛选。选择受支持的缓存或废弃扩展，核对路径后移入废纸篓。

@@ -74,14 +74,22 @@ import AppKit
         let diskRoot = temp.appendingPathComponent("disk")
         try FileManager.default.createDirectory(at: diskRoot.appendingPathComponent("folder"), withIntermediateDirectories: true)
         try Data(repeating: 1, count: 8192).write(to: diskRoot.appendingPathComponent("file"))
+        let fakeAnalyze = temp.appendingPathComponent("mo-analyze")
+        let completeAnalyzeScript = """
+        #!/bin/sh
+        test "$#" = 3 && test "$1" = analyze && test "$2" = --json || exit 2
+        printf '{"scan_status":"complete","path":"%s","entries":[{"scan_status":"complete","path":"%s/file","size":8192,"is_dir":false},{"scan_status":"complete","path":"%s/folder","size":0,"is_dir":true}]}' "$3" "$3" "$3"
+        """
+        try Data(completeAnalyzeScript.utf8).write(to: fakeAnalyze)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeAnalyze.path)
         let browser = DiskBrowser()
+        browser.moleExecutables = [fakeAnalyze.path]
         browser.scan(diskRoot)
         let diskTimeout = Date().addingTimeInterval(10)
         while browser.task != nil && Date() < diskTimeout { RunLoop.current.run(until: Date().addingTimeInterval(0.05)) }
         precondition(browser.task == nil && browser.items.count == 2)
         precondition(browser.items.contains { $0.path.hasSuffix("/file") && $0.bytes > 0 })
         precondition(browser.state.stringValue.contains("共 2 项"))
-        let fakeAnalyze = temp.appendingPathComponent("mo-analyze")
         let analyzeScript = """
         #!/bin/sh
         test "$#" = 3 && test "$1" = analyze && test "$2" = --json || exit 2

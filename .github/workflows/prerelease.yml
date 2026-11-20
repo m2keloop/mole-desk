@@ -54,7 +54,7 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "盘览.app/Contents/Info.plist"
           codesign --force --sign - "盘览.app"
           codesign --verify --deep --strict --verbose=2 "盘览.app"
-          lipo -verify_arch "$EXPECTED_ARCH" "盘览.app/Contents/MacOS/MoleDesk"
+          lipo "盘览.app/Contents/MacOS/MoleDesk" -verify_arch "$EXPECTED_ARCH"
       - name: Package macOS app
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}
